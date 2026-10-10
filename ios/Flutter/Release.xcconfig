@@ -1,0 +1,2 @@
+#include "Generated.xcconfig"
+GAD_APPLICATION_IDENTIFIER=__PUBLISHER_ADMOB_IOS_APP_ID__

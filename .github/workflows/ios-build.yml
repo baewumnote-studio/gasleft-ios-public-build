@@ -1,0 +1,223 @@
+name: GasLeft iOS build
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: First unsigned, then adhoc or testflight for the same verified commit
+        required: true
+        type: choice
+        options: [unsigned, adhoc, testflight]
+        default: unsigned
+      build_number:
+        description: Positive unused GasLeft build number
+        required: true
+        type: string
+        default: '1'
+      test_ads:
+        description: Mandatory for Ad Hoc; disable only for approved production AdMob IDs
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gasleft-ios-build
+  cancel-in-progress: false
+
+env:
+  GASLEFT_MODE: ${{ inputs.target }}
+  GASLEFT_BUILD_NUMBER: ${{ inputs.build_number }}
+  ADMOB_USE_TEST_ADS: ${{ inputs.test_ads && 'true' || 'false' }}
+  GASLEFT_UNSIGNED_VERIFIED_SHA: ${{ vars.GASLEFT_UNSIGNED_VERIFIED_SHA }}
+  BUNDLE_ID: com.healthmanagementprepare.gasleft
+  DEVELOPMENT_TEAM: 39762JRYD4
+  GASLEFT_PRIVACY_URL: https://gasleft-app.kjo25400.chatgpt.site/privacy/
+  PRIVACY_POLICY_URL: https://gasleft-app.kjo25400.chatgpt.site/privacy/
+  SUPPORT_EMAIL: healthmanagementprepare@gmail.com
+  APP_STORE_APPLE_ID: ${{ vars.APP_STORE_APPLE_ID }}
+  GAD_APPLICATION_IDENTIFIER: ${{ vars.GAD_APPLICATION_IDENTIFIER }}
+  ADMOB_INTERSTITIAL_IOS: ${{ vars.ADMOB_INTERSTITIAL_IOS }}
+
+jobs:
+  validate:
+    name: Existing tests and approved source on Linux
+    if: github.event.repository.private == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Verify owner, main branch, manual event and source preservation
+        run: python3 -B tool/public_ios.py guard
+      - name: Exercise actual signing failures and Windows path regression
+        run: |
+          set -euo pipefail
+          python3 -B tool/test_prepare_testflight.py
+          python3 -B tool/test_github_ios.py
+          python3 -B tool/test_direct_iphone.py
+          python3 -B tool/test_public_ios.py
+      - name: Install the pinned Flutter SDK
+        run: bash tool/install_flutter.sh
+      - name: Analyze and run the full existing Flutter suite
+        run: |
+          set -euo pipefail
+          flutter pub get --enforce-lockfile
+          dart format --output=none --set-exit-if-changed lib test tool/verify_beta_config.dart
+          flutter analyze --no-pub
+          flutter test --no-pub --reporter expanded
+          flutter test --no-pub tool/verify_beta_config.dart \
+            --dart-define=ADMOB_USE_TEST_ADS=true \
+            --dart-define=PRIVACY_POLICY_URL=https://example.org/gasleft/privacy \
+            --dart-define=SUPPORT_EMAIL=support@example.org
+          python3 -B tool/direct_iphone.py check-source
+
+  unsigned:
+    name: First unsigned iOS Release compilation
+    if: inputs.target == 'unsigned'
+    needs: validate
+    runs-on: macos-26
+    timeout-minutes: 15
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install the pinned Flutter SDK and verify Xcode
+        run: bash tool/install_flutter.sh
+      - name: Prepare the existing native project and plugin dependencies
+        run: |
+          set -euo pipefail
+          flutter pub get --enforce-lockfile
+          python3 -B tool/public_ios.py configure
+          flutter build ios --release --config-only --no-codesign --no-pub --build-number="$GASLEFT_BUILD_NUMBER" \
+            --dart-define-from-file=build/gasleft/release_dart_defines.json
+          if [ -f ios/Podfile ]; then
+            python3 -B -c 'import sys; from pathlib import Path; sys.path.insert(0, "tools"); import assemble_flutter_ios as a; a.patch_podfile(Path.cwd())'
+            pod install --project-directory=ios
+          fi
+          python3 -B tool/direct_iphone.py check-source
+      - name: Compile the iOS Release app without any signing credentials
+        run: |
+          set -euo pipefail
+          flutter build ios --release --no-codesign --no-pub --build-number="$GASLEFT_BUILD_NUMBER" \
+            --dart-define-from-file=build/gasleft/release_dart_defines.json
+          python3 -B tool/direct_iphone.py check-source
+          python3 -B tool/public_ios.py verify-unsigned
+
+  signing_preflight:
+    name: Real signing and private retention preflight on Linux
+    if: inputs.target != 'unsigned'
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: gasleft-signing
+    env:
+      GASLEFT_SIGNING_APPROVED: ${{ vars.GASLEFT_SIGNING_APPROVED }}
+      GASLEFT_DIRECT_INSTALL_APPROVED: ${{ vars.GASLEFT_SIGNING_APPROVED }}
+      GASLEFT_APPLE_ACCOUNT_READY: ${{ vars.GASLEFT_APPLE_ACCOUNT_READY }}
+      GASLEFT_TARGET: testflight
+      GASLEFT_UPLOAD: 'true'
+      GASLEFT_P12_BASE64: ${{ secrets.GASLEFT_P12_BASE64 }}
+      GASLEFT_P12_PASSWORD: ${{ secrets.GASLEFT_P12_PASSWORD }}
+      GASLEFT_PROFILE_BASE64: ${{ inputs.target == 'adhoc' && secrets.GASLEFT_ADHOC_PROFILE_BASE64 || secrets.GASLEFT_PROFILE_BASE64 }}
+      GASLEFT_ADHOC_PROFILE_BASE64: ${{ secrets.GASLEFT_ADHOC_PROFILE_BASE64 }}
+      GASLEFT_ADHOC_DEVICE_UDID: ${{ secrets.GASLEFT_ADHOC_DEVICE_UDID }}
+      GASLEFT_ASC_KEY_ID: ${{ secrets.GASLEFT_ASC_KEY_ID }}
+      GASLEFT_ASC_ISSUER_ID: ${{ secrets.GASLEFT_ASC_ISSUER_ID }}
+      GASLEFT_ASC_PRIVATE_KEY: ${{ secrets.GASLEFT_ASC_PRIVATE_KEY }}
+      GASLEFT_PRIVATE_ARTIFACT_TOKEN: ${{ secrets.GASLEFT_PRIVATE_ARTIFACT_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install the pinned Apple JWT verification dependency
+        if: inputs.target == 'testflight'
+        run: python3 -m pip install --disable-pip-version-check cryptography==50.0.2
+      - name: Check CMS, P12, certificate, profile, Apple app and private vault
+        run: python3 -B tool/public_ios.py preflight
+
+  signed:
+    name: One signed IPA with private output retention
+    if: inputs.target != 'unsigned'
+    needs: signing_preflight
+    runs-on: macos-26
+    timeout-minutes: 18
+    environment: gasleft-signing
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      GASLEFT_SIGNING_APPROVED: ${{ vars.GASLEFT_SIGNING_APPROVED }}
+      GASLEFT_DIRECT_INSTALL_APPROVED: ${{ vars.GASLEFT_SIGNING_APPROVED }}
+      GASLEFT_APPLE_ACCOUNT_READY: ${{ vars.GASLEFT_APPLE_ACCOUNT_READY }}
+      GASLEFT_P12_BASE64: ${{ secrets.GASLEFT_P12_BASE64 }}
+      GASLEFT_P12_PASSWORD: ${{ secrets.GASLEFT_P12_PASSWORD }}
+      GASLEFT_PROFILE_BASE64: ${{ inputs.target == 'adhoc' && secrets.GASLEFT_ADHOC_PROFILE_BASE64 || secrets.GASLEFT_PROFILE_BASE64 }}
+      GASLEFT_ADHOC_PROFILE_BASE64: ${{ secrets.GASLEFT_ADHOC_PROFILE_BASE64 }}
+      GASLEFT_ADHOC_DEVICE_UDID: ${{ secrets.GASLEFT_ADHOC_DEVICE_UDID }}
+      GASLEFT_PRIVATE_ARTIFACT_TOKEN: ${{ secrets.GASLEFT_PRIVATE_ARTIFACT_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install the pinned Flutter SDK and verify Xcode
+        run: bash tool/install_flutter.sh
+      - name: Configure the preserved app and native dependencies
+        run: |
+          set -euo pipefail
+          flutter pub get --enforce-lockfile
+          python3 -B tool/public_ios.py configure
+          flutter build ios --release --config-only --no-codesign --no-pub --build-number="$GASLEFT_BUILD_NUMBER" \
+            --dart-define-from-file=build/gasleft/release_dart_defines.json
+          if [ -f ios/Podfile ]; then
+            python3 -B -c 'import sys; from pathlib import Path; sys.path.insert(0, "tools"); import assemble_flutter_ios as a; a.patch_podfile(Path.cwd())'
+            pod install --project-directory=ios
+          fi
+      - name: Import the existing certificate and exact GasLeft profile
+        run: bash tool/public_signing.sh
+      - name: Verify the preserved source and actual Ad Hoc Release settings
+        run: |
+          set -euo pipefail
+          python3 -B tool/direct_iphone.py check-source
+          if [ "$GASLEFT_MODE" = adhoc ]; then
+            python3 -B tool/direct_iphone.py settings --build-number="$GASLEFT_BUILD_NUMBER"
+          fi
+      - name: Archive and export one signed IPA
+        id: ipa
+        run: |
+          set -euo pipefail
+          flutter build ipa --release --no-pub --build-number="$GASLEFT_BUILD_NUMBER" \
+            --dart-define-from-file=build/gasleft/release_dart_defines.json \
+            --export-options-plist=build/gasleft/ExportOptions.plist
+          GASLEFT_IPA="$(find build/ios/ipa -maxdepth 1 -name '*.ipa' -print -quit)"
+          if [ "$GASLEFT_MODE" = adhoc ]; then
+            python3 -B tool/direct_iphone.py verify-mac --ipa "$GASLEFT_IPA" --build-number="$GASLEFT_BUILD_NUMBER"
+          else
+            python3 -B tool/public_ios.py verify-store --ipa "$GASLEFT_IPA"
+          fi
+      - name: Preserve signed output and the original archive in the private GasLeft vault
+        if: always()
+        run: python3 -B tool/public_ios.py retain
+      - name: Upload the verified build directly to App Store Connect
+        if: success() && inputs.target == 'testflight' && steps.ipa.outcome == 'success'
+        env:
+          GASLEFT_ASC_KEY_ID: ${{ secrets.GASLEFT_ASC_KEY_ID }}
+          GASLEFT_ASC_ISSUER_ID: ${{ secrets.GASLEFT_ASC_ISSUER_ID }}
+          GASLEFT_ASC_PRIVATE_KEY: ${{ secrets.GASLEFT_ASC_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          python3 -B tool/github_ios.py key
+          xcrun altool --upload-app --type ios \
+            --file "$(find build/ios/ipa -maxdepth 1 -name '*.ipa' -print -quit)" \
+            --apiKey "$GASLEFT_ASC_KEY_ID" --apiIssuer "$GASLEFT_ASC_ISSUER_ID"
+      - name: Remove only this runner's signing files and restore its default keychain
+        if: always()
+        run: |
+          security default-keychain -d user -s "$HOME/Library/Keychains/login.keychain-db" 2>/dev/null || true
+          security delete-keychain "$RUNNER_TEMP/gasleft-signing.keychain-db" 2>/dev/null || true
+          python3 -B tool/github_ios.py cleanup
+
+# No upload-artifact action, App Review submission, release, or tester invitation.
